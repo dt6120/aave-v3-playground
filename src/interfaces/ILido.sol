@@ -7,6 +7,11 @@ interface ILido is IERC20 {
     function submit(address _referral) external payable returns (uint256);
 }
 
+interface IWstETH {
+    function wrap(uint256 _stETHAmount) external returns (uint256);
+    function unwrap(uint256 _wstETHAmount) external returns (uint256);
+}
+
 interface ILidoWithdrawalQueue {
     /// @notice output format struct for `_getWithdrawalStatus()` method
     struct WithdrawalRequestStatus {
