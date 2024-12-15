@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {console} from "forge-std/Test.sol";
+
 import {ERC4626, ERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 
 import {IPool} from "aave-v3-core/contracts/interfaces/IPool.sol";
+import {IPriceOracle} from "aave-v3-core/contracts/interfaces/IPriceOracle.sol";
 import {IPoolAddressesProvider} from "aave-v3-core/contracts/interfaces/IPoolAddressesProvider.sol";
+import {IWETH} from "aave-v3-core/contracts/misc/interfaces/IWETH.sol";
 import {VariableDebtToken} from "aave-v3-core/contracts/protocol/tokenization/VariableDebtToken.sol";
 import {DataTypes} from "aave-v3-core/contracts/protocol/libraries/types/DataTypes.sol";
+
+import {ISwapRouter} from "uniswap-v3-periphery/interfaces/ISwapRouter.sol";
+
+import {PercentageMath} from "aave-v3-core/contracts/protocol/libraries/math/PercentageMath.sol";
+import {WadRayMath} from "aave-v3-core/contracts/protocol/libraries/math/WadRayMath.sol";
 
 import {ILido, ILidoWithdrawalQueue} from "./interfaces/ILido.sol";
 
@@ -15,13 +24,19 @@ contract MyVault is ERC4626 {
     error MyVault__LenderPositionExists();
     error MyVault__HealthFactorTooLow();
     error MyVault__AssetTransferFailed();
-    error MyVault__InsufficientLenderDeposits(uint256 expected, uint256 received);
+    error MyVault__InsufficientLenderDeposits();
     error MyVault__UnstakeRequestNotFinalized();
+
+    using WadRayMath for uint256;
+    using PercentageMath for uint256;
 
     uint256 public constant HEALTH_FACTOR_PRECISION = 1e18;
     uint256 public constant MINIMUM_HEALTH_FACTOR = 1 * HEALTH_FACTOR_PRECISION;
     uint256 public constant MAX_DEADLINE = type(uint256).max;
     uint256 public constant LIDO_MAX_UNSTAKE_AMOUNT = 1000 ether;
+
+    address public immutable uniswapV3Router = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address public immutable weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     IPoolAddressesProvider immutable pap;
     IPool immutable pool;
@@ -33,19 +48,32 @@ contract MyVault is ERC4626 {
     struct LenderData {
         uint256 delegatedAmount;
         uint256 usedAmount;
-        uint256 minimumHealthFactor;
+        uint256 minHealthFactor;
     }
 
-    mapping(address user => LenderData lenderData) private userToLenderData;
+    struct LenderDelegation {
+        address lender;
+        uint256 amount;
+    }
+
+    struct BorrowerPosition {
+        uint256 amount;
+        LenderDelegation[] delegations;
+    }
+
+    mapping(address lender => LenderData data) private lenderData;
+    mapping(address borrower => BorrowerPosition position) private borrowPositions;
+
     address[] private lenders;
     uint256 private totalLenderDeposits;
 
-    event LenderPositionCreated(address lender, uint256 amount, uint256 minimumHealthFactor);
+    event LenderPositionCreated(address lender, uint256 amount, uint256 minHealthFactor);
     event LenderDepositUtilized(address lender, uint256 amount);
     event LeveragePositionCreated(address borrower, uint256 amount, uint256 leverage);
     event LidoStakeCreated(uint256 stakedAmount, uint256 stEthMinted);
     event LidoUnstakeInitiated(uint256 amount, uint256[] requestIds);
     event LidoUnstakeClaimed(uint256[] requestIds);
+    event AssetConvertedToETH(uint256 assetAmount, uint256 ethAmount);
     event GeneratingYieldWithStETH(uint256 amount);
 
     modifier nonZeroAmount(uint256 amount) {
@@ -72,19 +100,16 @@ contract MyVault is ERC4626 {
         lidoWithdraw = _lidoWithdraw;
     }
 
-    function supplyCollateralAndDelegateCredit(
-        uint256 amount,
-        uint256 minimumHealthFactor,
-        uint8 v,
-        bytes32 r,
-        bytes32 s
-    ) external nonZeroAmount(amount) {
-        if (minimumHealthFactor < MINIMUM_HEALTH_FACTOR) {
+    function supplyCollateralAndDelegateCredit(uint256 amount, uint256 minHealthFactor, uint8 v, bytes32 r, bytes32 s)
+        external
+        nonZeroAmount(amount)
+    {
+        if (minHealthFactor < MINIMUM_HEALTH_FACTOR) {
             revert MyVault__HealthFactorTooLow();
         }
 
         // initialize new lending position for caller
-        _createLenderPosition(msg.sender, amount, minimumHealthFactor);
+        _createLenderPosition(msg.sender, amount, minHealthFactor);
 
         // ensure caller has approved this contract to transfer asset
         _supplyCollateral(msg.sender, amount);
@@ -104,42 +129,47 @@ contract MyVault is ERC4626 {
         if (!success) {
             revert MyVault__AssetTransferFailed();
         }
+        // deposit(amount, msg.sender);
 
         uint256 amountToBorrow = amount * leverage;
         uint256 amountLeftToBorrow = amountToBorrow;
 
         if (amountLeftToBorrow > totalLenderDeposits) {
-            revert MyVault__InsufficientLenderDeposits(amountLeftToBorrow, totalLenderDeposits);
+            revert MyVault__InsufficientLenderDeposits();
         }
 
-        for (uint256 i = 0; i < lenders.length && amountLeftToBorrow > 0; i++) {
-            uint256 borrowedAmount = _borrowUsingLenderDeposit(lenders[i], amountLeftToBorrow);
-            amountLeftToBorrow = amountLeftToBorrow - borrowedAmount;
+        (bool lendersFound, LenderDelegation[] memory delegations) = _borrowUsingLenderDeposits(amountToBorrow);
+
+        if (!lendersFound) {
+            revert MyVault__InsufficientLenderDeposits();
         }
+
+        BorrowerPosition memory position = BorrowerPosition(amountToBorrow, delegations);
+        borrowPositions[msg.sender] = position;
 
         emit LeveragePositionCreated(msg.sender, amount, leverage);
 
         uint256 ethAmount = _convertAssetToETH(amountToBorrow);
-
-        uint256 stEthMinted = _stakeWithLido(ethAmount);
+        uint256 stEthMintAmount = _stakeWithLido(ethAmount);
 
         // any additional yield strategy using liquid staking tokens ?
-        _generateYield(stEthMinted);
+        _generateYield(stEthMintAmount);
     }
 
-    function getHealthFactor() external {
+    function getHealthFactor(address lender) external view returns (uint256 healthFactor) {
         // hf = ($collateral + $lockedAsset) * liquidationthreshold / debtborrowed
+        healthFactor = _getLenderHealthFactor(lender);
     }
 
-    function liquidate() external {}
+    function liquidate() external pure {}
 
-    function _createLenderPosition(address lender, uint256 amount, uint256 minimumHealthFactor) internal {
-        if (userToLenderData[lender].delegatedAmount > 0) {
+    function _createLenderPosition(address lender, uint256 amount, uint256 minHealthFactor) internal {
+        if (lenderData[lender].delegatedAmount > 0) {
             revert MyVault__LenderPositionExists();
         }
 
         lenders.push(lender);
-        userToLenderData[lender] = LenderData(amount, 0, minimumHealthFactor);
+        lenderData[lender] = LenderData(amount, 0, minHealthFactor);
 
         totalLenderDeposits = totalLenderDeposits + amount;
 
@@ -147,7 +177,7 @@ contract MyVault is ERC4626 {
         // mint corresponding shares to caller
         deposit(amount, lender);
 
-        emit LenderPositionCreated(lender, amount, minimumHealthFactor);
+        emit LenderPositionCreated(lender, amount, minHealthFactor);
     }
 
     function _supplyCollateral(address onBehalfOf, uint256 amount) internal {
@@ -166,22 +196,37 @@ contract MyVault is ERC4626 {
         vdt.delegationWithSig(onBehalfOf, address(this), amount, MAX_DEADLINE, v, r, s);
     }
 
-    function _borrowUsingLenderDeposit(address lender, uint256 amount) internal returns (uint256 borrowedAmount) {
+    function _borrowUsingLenderDeposits(uint256 amount)
+        internal
+        returns (bool lendersFound, LenderDelegation[] memory delegations)
+    {
+        delegations = new LenderDelegation[](lenders.length);
+
+        for (uint256 i = 0; i < lenders.length && amount > 0; i++) {
+            uint256 borrowedAmount = _borrowUsingLenderDeposit(lenders[i], amount);
+            if (borrowedAmount > 0) {
+                amount = amount - borrowedAmount;
+                delegations[i] = LenderDelegation(lenders[i], borrowedAmount);
+            }
+        }
+
+        lendersFound = amount == 0;
+    }
+
+    function _borrowUsingLenderDeposit(address lender, uint256 amount) internal returns (uint256 borrowAmount) {
         // need to check if borrow amount breaks health factor
         // what is the denomination of borrow amount ?
-        uint256 maxBorrowAmount = _getBorrowableAmount(lender);
+        borrowAmount = _getBorrowableAmount(lender, amount);
 
-        borrowedAmount = amount > maxBorrowAmount ? maxBorrowAmount : amount;
-        totalLenderDeposits = totalLenderDeposits - borrowedAmount;
-
-        // userToLenderData[lender].usedAmount = userToLenderData[lender].usedAmount - borrowedAmount;
-
-        uint256 healthFactorEstimate = _estimateHealthFactorAfterBorrow(lender, borrowedAmount);
-        if (healthFactorEstimate < userToLenderData[lender].minimumHealthFactor) {
+        uint256 healthFactorEstimate = _estimateHealthFactorAfterBorrow(lender, borrowAmount);
+        if (healthFactorEstimate < lenderData[lender].minHealthFactor) {
             return 0;
         }
 
-        pool.borrow(address(usdc), borrowedAmount, 2, 0, lender);
+        totalLenderDeposits = totalLenderDeposits - borrowAmount;
+        lenderData[lender].usedAmount = lenderData[lender].usedAmount + borrowAmount;
+
+        pool.borrow(address(usdc), borrowAmount, 2, 0, lender);
 
         // if health factor goes below lender terms, need to revert
         _revertIfHealthFactorBreaks(lender);
@@ -191,7 +236,21 @@ contract MyVault is ERC4626 {
 
     function _convertAssetToETH(uint256 amount) internal returns (uint256 ethAmount) {
         // swap asset for ETH
-        ethAmount = 1 ether / 1000;
+        // uniswapRouterV3.swapExactTokenForETH();
+        //     struct ExactInputParams {
+        //     bytes path;
+        //     address recipient;
+        //     uint256 deadline;
+        //     uint256 amountIn;
+        //     uint256 amountOutMinimum;
+        // }
+        ISwapRouter.ExactInputParams memory params =
+            ISwapRouter.ExactInputParams("0x", address(this), block.timestamp, amount, 0);
+        uint256 amountOut = ISwapRouter(uniswapV3Router).exactInput(params);
+
+        IWETH(weth).withdraw(amountOut);
+
+        emit AssetConvertedToETH(amount, amountOut);
     }
 
     function _stakeWithLido(uint256 amount) internal returns (uint256 stEthMinted) {
@@ -203,9 +262,11 @@ contract MyVault is ERC4626 {
 
     function _generateYield(uint256 amount) internal {
         // convert stETH to wstETH using DEX
-        // supply stETH on AAVE V3
-        lido.approve(address(pool), amount);
-        pool.supply(address(lido), amount, address(this), 0);
+        // uniswapRouterV3.swapExactTokenForTokens()
+
+        // supply wstETH on AAVE V3
+        // lido.approve(address(pool), amount);
+        // pool.supply(address(lido), amount, address(this), 0);
 
         emit GeneratingYieldWithStETH(amount);
     }
@@ -256,14 +317,28 @@ contract MyVault is ERC4626 {
         emit LidoUnstakeClaimed(requestIds);
     }
 
-    function _getLenderHealthFactor(address lender) internal view returns (uint256 healthFactor) {
-        (,,,,, healthFactor) = pool.getUserAccountData(lender);
+    function _getLenderHealthFactor(address lender) internal view returns (uint256 customHealthFactor) {
+        (
+            uint256 totalCollateralBase,
+            uint256 totalDebtBase,
+            uint256 availableBorrowsBase,
+            uint256 currentLiquidationThreshold,
+            uint256 ltv,
+            uint256 healthFactor
+        ) = pool.getUserAccountData(lender);
+
+        uint256 whatBorrowerDepositedBase = 0;
+        customHealthFactor = totalDebtBase == 0
+            ? type(uint256).max
+            : (totalCollateralBase + whatBorrowerDepositedBase).percentMul(currentLiquidationThreshold).wadDiv(
+                totalDebtBase
+            );
     }
 
     function _isHealthFactorOkay(address lender) internal view returns (bool isHealthy) {
         uint256 currentHealthFactor = _getLenderHealthFactor(lender);
-        uint256 minimumHealthFactor = userToLenderData[lender].minimumHealthFactor;
-        isHealthy = currentHealthFactor >= minimumHealthFactor;
+        uint256 minHealthFactor = lenderData[lender].minHealthFactor;
+        isHealthy = currentHealthFactor >= minHealthFactor;
     }
 
     function _revertIfHealthFactorBreaks(address lender) internal view {
@@ -276,19 +351,54 @@ contract MyVault is ERC4626 {
         (uint256 totalCollateralBase,,,,,) = pool.getUserAccountData(lender);
     }
 
-    function _getBorrowableAmount(address lender) internal view returns (uint256 borrowableAmount) {
-        (,, borrowableAmount,,,) = pool.getUserAccountData(lender);
+    function _getBorrowableAmount(address lender, uint256 amount) public view returns (uint256 borrowableAmount) {
+        (
+            uint256 totalCollateralBase,
+            uint256 totalDebtBase,
+            uint256 borrowableAmountBase,
+            uint256 liquidationThreshold,
+            uint256 ltv,
+        ) = pool.getUserAccountData(lender);
+
+        uint256 whatBorrowerDepositedBase = 0;
+        uint256 totalDebtBaseEstimate =
+            (totalCollateralBase + whatBorrowerDepositedBase).percentMul(ltv).wadDiv(lenderData[lender].minHealthFactor);
+        borrowableAmount =
+            totalDebtBaseEstimate > totalDebtBase ? _convertBaseAmountToAsset(totalDebtBaseEstimate - totalDebtBase) : 0;
+
+        borrowableAmount = amount > borrowableAmount ? borrowableAmount : amount;
     }
 
     function _estimateHealthFactorAfterBorrow(address lender, uint256 amount)
-        internal
+        public
         view
         returns (uint256 healthFactor)
     {
         (uint256 totalCollateralBase, uint256 totalDebtBase,, uint256 liquidationThreshold,,) =
             pool.getUserAccountData(lender);
 
-        healthFactor = totalCollateralBase * liquidationThreshold / (totalDebtBase + amount);
+        uint256 amountBase = _convertAssetToBaseAmount(amount);
+
+        uint256 whatBorrowerDepositedBase = 0;
+        healthFactor = (totalCollateralBase + whatBorrowerDepositedBase).percentMul(liquidationThreshold).wadDiv(
+            totalDebtBase + amountBase
+        );
+    }
+
+    function _convertBaseAmountToAsset(uint256 amount) public view returns (uint256 assetAmount) {
+        IPriceOracle oracle = IPriceOracle(pap.getPriceOracle());
+        uint256 assetPrice = oracle.getAssetPrice(asset());
+        assetAmount = amount * (10 ** decimals()) / assetPrice;
+    }
+
+    function _convertAssetToBaseAmount(uint256 amount) public view returns (uint256 baseAmount) {
+        IPriceOracle oracle = IPriceOracle(pap.getPriceOracle());
+        uint256 assetPrice = oracle.getAssetPrice(asset());
+        baseAmount = amount * assetPrice / (10 ** decimals());
+    }
+
+    function getTotalAvailableLenderDeposits() external view returns (uint256 totalDeposits) {
+        totalDeposits = totalLenderDeposits;
     }
 
     function getDelegateCreditDigest(address delegatee, uint256 amount, uint256 nonce)
