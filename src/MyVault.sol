@@ -17,7 +17,7 @@ import {ISwapRouter} from "uniswap-v3-periphery/interfaces/ISwapRouter.sol";
 import {PercentageMath} from "aave-v3-core/contracts/protocol/libraries/math/PercentageMath.sol";
 import {WadRayMath} from "aave-v3-core/contracts/protocol/libraries/math/WadRayMath.sol";
 
-import {ILido, ILidoWithdrawalQueue} from "./interfaces/ILido.sol";
+import {ILido, ILidoWithdrawalQueue, IWstETH} from "./interfaces/ILido.sol";
 
 contract MyVault is ERC4626 {
     error MyVault__NonZeroAmountRequired();
@@ -74,7 +74,7 @@ contract MyVault is ERC4626 {
     event LidoUnstakeInitiated(uint256 amount, uint256[] requestIds);
     event LidoUnstakeClaimed(uint256[] requestIds);
     event AssetConvertedToETH(uint256 assetAmount, uint256 ethAmount);
-    event GeneratingYieldWithStETH(uint256 amount);
+    event GeneratingYieldWithWstETH(uint256 amount);
 
     modifier nonZeroAmount(uint256 amount) {
         if (amount == 0) {
@@ -235,40 +235,49 @@ contract MyVault is ERC4626 {
     }
 
     function _convertAssetToETH(uint256 amount) internal returns (uint256 ethAmount) {
-        // swap asset for ETH
-        // uniswapRouterV3.swapExactTokenForETH();
-        //     struct ExactInputParams {
-        //     bytes path;
-        //     address recipient;
-        //     uint256 deadline;
-        //     uint256 amountIn;
-        //     uint256 amountOutMinimum;
-        // }
-        ISwapRouter.ExactInputParams memory params =
-            ISwapRouter.ExactInputParams("0x", address(this), block.timestamp, amount, 0);
-        uint256 amountOut = ISwapRouter(uniswapV3Router).exactInput(params);
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: address(usdc),
+            tokenOut: weth,
+            fee: uint24(3000),
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: amount,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0
+        });
 
-        IWETH(weth).withdraw(amountOut);
+        usdc.approve(uniswapV3Router, amount);
+        ethAmount = ISwapRouter(uniswapV3Router).exactInputSingle(params);
 
-        emit AssetConvertedToETH(amount, amountOut);
+        IERC20(weth).approve(weth, ethAmount);
+        IWETH(weth).withdraw(ethAmount);
+
+        emit AssetConvertedToETH(amount, ethAmount);
     }
 
     function _stakeWithLido(uint256 amount) internal returns (uint256 stEthMinted) {
         // stake leveraged amount to lido contract
         stEthMinted = lido.submit{value: amount}(address(0));
 
+        // CAN DIRECTLY SEND ETH TO wstETH CONTRACT
+        // IT IS SHORTCUT TO STAKE AND CONVERT stETH TO wstETH
+        // IN ONE STEP
+
+        // address wstETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
+
         emit LidoStakeCreated(amount, stEthMinted);
     }
 
     function _generateYield(uint256 amount) internal {
-        // convert stETH to wstETH using DEX
-        // uniswapRouterV3.swapExactTokenForTokens()
+        address wstETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
 
         // supply wstETH on AAVE V3
-        // lido.approve(address(pool), amount);
-        // pool.supply(address(lido), amount, address(this), 0);
+        lido.approve(wstETH, amount);
+        uint256 wstEthMinted = IWstETH(wstETH).wrap(amount);
+        IERC20(wstETH).approve(address(pool), wstEthMinted);
+        pool.supply(wstETH, wstEthMinted, address(this), 0);
 
-        emit GeneratingYieldWithStETH(amount);
+        emit GeneratingYieldWithWstETH(wstEthMinted);
     }
 
     function _initiateUnstakeWithLido(uint256 amount) internal {
@@ -414,4 +423,6 @@ contract MyVault is ERC4626 {
             )
         );
     }
+
+    receive() external payable {}
 }
