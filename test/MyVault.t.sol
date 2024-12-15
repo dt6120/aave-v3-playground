@@ -32,13 +32,14 @@ contract MyVaultTest is Test {
     uint256 constant BORROWER_COUNT = 3;
 
     uint256 constant MAX_LEVERAGE = 5;
+    uint256 constant MIN_USDC_AMOUNT = 10;
 
     address[] lenders;
     uint256[] lenderKeys;
     address[] borrowers;
 
     modifier delegateCredit(uint256 amount, uint256 lenderCount) {
-        amount = bound(amount, 1, STARTING_USDC_BALANCE);
+        amount = bound(amount, MIN_USDC_AMOUNT, STARTING_USDC_BALANCE);
 
         for (uint256 i = 0; i < lenderCount; i++) {
             address lender = lenders[i];
@@ -117,8 +118,7 @@ contract MyVaultTest is Test {
         uint256 borrowerSeed,
         uint256 leverageSeed
     ) external delegateCredit(STARTING_USDC_BALANCE, 6) {
-        amount = amount % STARTING_USDC_BALANCE;
-        vm.assume(amount != 0);
+        amount = bound(amount, MIN_USDC_AMOUNT, STARTING_USDC_BALANCE);
 
         uint256 leverage = leverageSeed % MAX_LEVERAGE;
         vm.assume(leverage != 0);
